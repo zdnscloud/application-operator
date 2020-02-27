@@ -165,6 +165,10 @@ func (m *ApplicationManager) OnUpdate(e event.UpdateEvent) (handler.Result, erro
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	switch obj := e.ObjectNew.(type) {
+	case *appv1beta1.Application:
+		if oldApp := e.ObjectOld.(*appv1beta1.Application); oldApp.GetDeletionTimestamp() == nil && obj.GetDeletionTimestamp() != nil {
+			m.appCache.OnDeleteApplication(m.kubeClient, obj)
+		}
 	case *appsv1.Deployment:
 		if oldDeploy := e.ObjectOld.(*appsv1.Deployment); oldDeploy.Status.ReadyReplicas != obj.Status.ReadyReplicas {
 			m.appCache.OnUpdateAppResource(m.kubeClient, appv1beta1.AppResource{

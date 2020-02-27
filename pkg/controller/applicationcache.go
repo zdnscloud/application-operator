@@ -32,8 +32,8 @@ var (
 )
 
 const (
-	zcloudAppFinalizer         = "app.zcloud.cn/v1beta1/finalizer"
-	ZcloudAppRequestUrlPrefix  = "app.zcloud.cn/v1beta1/request-url-prefix"
+	zcloudAppFinalizer         = "app.zcloud.cn.v1beta1/finalizer"
+	ZcloudAppRequestUrlPrefix  = "app.zcloud.cn.v1beta1/url-prefix"
 	AnnKeyForInjectServiceMesh = "linkerd.io/inject"
 )
 
@@ -82,9 +82,20 @@ func genResourceID(resource appv1beta1.AppResource) string {
 }
 
 func (ac *ApplicationCache) OnCreateApplication(cli client.Client, app *appv1beta1.Application) {
+	if _, ok := ac.getAppResources(app.Namespace, app.Name); ok {
+		return
+	}
+
+	app.Status.State = appv1beta1.ApplicationStatusStateCreate
+	if err := cli.Status().Update(context.TODO(), app); err != nil {
+		log.Warnf("update app %s with namespace %s status to create failed: %s", app.Name, app.Namespace, err.Error())
+		return
+	}
+
 	if err := createResources(cli, app); err != nil {
 		log.Warnf("create app %s resources with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
-		if err := cli.Update(context.TODO(), app); err != nil {
+		app.Status.State = appv1beta1.ApplicationStatusStateFailed
+		if err := cli.Status().Update(context.TODO(), app); err != nil {
 			log.Warnf("update app %s state to failed with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
 		}
 		return
@@ -92,10 +103,27 @@ func (ac *ApplicationCache) OnCreateApplication(cli client.Client, app *appv1bet
 
 	helper.AddFinalizer(app, zcloudAppFinalizer)
 	if err := cli.Update(context.TODO(), app); err != nil {
-		log.Warnf("update app %s with namespace %s after create app resources failed: %s", app.Name, app.Namespace, err.Error())
-	} else {
-		ac.Add(app)
+		log.Warnf("add finalizer to app %s with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
+		return
 	}
+
+	app.Status.State = appv1beta1.ApplicationStatusStateSucceed
+	if err := cli.Status().Update(context.TODO(), app); err != nil {
+		log.Warnf("update app %s status with namespace %s after create app resources failed: %s", app.Name, app.Namespace, err.Error())
+		return
+	}
+
+	ac.Add(app)
+}
+
+func (ac *ApplicationCache) getAppResources(namespace, name string) (appv1beta1.AppResources, bool) {
+	if appAndResources, ok := ac.nsAndApplications[namespace]; ok {
+		if rs, ok := appAndResources[name]; ok {
+			return rs, true
+		}
+	}
+
+	return nil, false
 }
 
 func createResources(cli client.Client, app *appv1beta1.Application) error {
@@ -132,12 +160,10 @@ func createResources(cli client.Client, app *appv1beta1.Application) error {
 			}
 			return nil
 		}); err != nil {
-			app.Status.State = appv1beta1.ApplicationStatusStateFailed
 			return err
 		}
 	}
 
-	app.Status.State = appv1beta1.ApplicationStatusStateSucceed
 	sort.Sort(app.Status.AppResources)
 	return nil
 }
@@ -229,7 +255,7 @@ func injectServiceMeshToWorkload(typ string, app *appv1beta1.Application, obj ru
 }
 
 func (ac *ApplicationCache) OnCreateAppResource(cli client.Client, resource appv1beta1.AppResource) {
-	appInfo, _, found := ac.getAppInfoAndResources(resource)
+	appInfo, found := ac.getAppInfo(resource)
 	if found == false {
 		return
 	}
@@ -246,42 +272,25 @@ func (ac *ApplicationCache) OnCreateAppResource(cli client.Client, resource appv
 
 	resource.Exists = true
 	updateAppResources(resource, app.Status.AppResources)
-	if slice.SliceIndex(supportWorkloadTypes, string(resource.Type)) != -1 && resource.Replicas == resource.ReadyReplicas {
-		app.Status.ReadyWorkloadCount += 1
+	if app.Status.WorkloadCount != app.Status.ReadyWorkloadCount {
+		if slice.SliceIndex(supportWorkloadTypes, string(resource.Type)) != -1 && resource.Replicas == resource.ReadyReplicas {
+			app.Status.ReadyWorkloadCount += 1
+		}
 	}
 
-	if err := cli.Update(context.TODO(), app); err != nil {
+	if err := cli.Status().Update(context.TODO(), app); err != nil {
 		log.Warnf("update app %s with namespace %s after create resource %s with namespace %s failed: %s",
 			appInfo.Name, appInfo.Namespace, resource.Name, resource.Namespace, err.Error())
 	}
 }
 
-func (ac *ApplicationCache) getAppInfoAndResources(resource appv1beta1.AppResource) (*ApplicationInfo, appv1beta1.AppResources, bool) {
-	resourcesAndApps, ok := ac.nsAndAppResources[resource.Namespace]
-	if ok == false {
-		return nil, nil, false
+func (ac *ApplicationCache) getAppInfo(resource appv1beta1.AppResource) (*ApplicationInfo, bool) {
+	if resourcesAndApps, ok := ac.nsAndAppResources[resource.Namespace]; ok {
+		if appInfo, ok := resourcesAndApps[genResourceID(resource)]; ok {
+			return appInfo, true
+		}
 	}
-
-	appInfo, ok := resourcesAndApps[genResourceID(resource)]
-	if ok == false {
-		return nil, nil, false
-	}
-
-	appAndResources, ok := ac.nsAndApplications[appInfo.Namespace]
-	if ok == false {
-		log.Warnf("no found app and its resource info with namespace %s", appInfo.Namespace)
-		return nil, nil, false
-	}
-
-	resources, ok := appAndResources[appInfo.Name]
-	if ok == false {
-		log.Warnf("no found app %s with namespace %s", appInfo.Name, appInfo.Namespace)
-		return nil, nil, false
-	}
-
-	rs := make(appv1beta1.AppResources, len(resources))
-	copy(rs, resources)
-	return appInfo, rs, true
+	return nil, false
 }
 
 func updateAppResources(resource appv1beta1.AppResource, resources appv1beta1.AppResources) {
@@ -302,16 +311,23 @@ func (ac *ApplicationCache) OnUpdateAppResource(cli client.Client, resource appv
 }
 
 func (ac *ApplicationCache) OnDeleteApplication(cli client.Client, app *appv1beta1.Application) {
-	if err := deleteResources(cli, app); err != nil {
-		log.Warnf("delete application %s resources with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
-		if err := cli.Update(context.TODO(), app); err != nil {
-			log.Warnf("update app %s state to failed with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
-		}
+	if _, ok := ac.getAppResources(app.Namespace, app.Name); ok == false {
 		return
 	}
 
+	if len(app.Status.AppResources) != 0 {
+		if err := deleteResources(cli, app); err != nil {
+			log.Warnf("delete application %s resources with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
+			app.Status.State = appv1beta1.ApplicationStatusStateFailed
+			if err := cli.Status().Update(context.TODO(), app); err != nil {
+				log.Warnf("update app %s state to failed with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
+			}
+			return
+		}
+	}
+
 	if len(ac.nsAndApplications[app.Namespace][app.Name]) == 0 {
-		ac.deleteApplication(cli, app)
+		delete(ac.nsAndApplications[app.Namespace], app.Name)
 	}
 }
 
@@ -335,21 +351,11 @@ func deleteResources(cli client.Client, app *appv1beta1.Application) error {
 
 			return nil
 		}); err != nil {
-			app.Status.State = appv1beta1.ApplicationStatusStateFailed
 			return err
 		}
 	}
 
 	return nil
-}
-
-func (ac *ApplicationCache) deleteApplication(cli client.Client, app *appv1beta1.Application) {
-	helper.RemoveFinalizer(app, zcloudAppFinalizer)
-	if err := cli.Update(context.TODO(), app); err != nil {
-		log.Warnf("update app %s with namespace %s after delete app resources failed: %s", app.Name, app.Namespace, err.Error())
-	} else {
-		delete(ac.nsAndApplications[app.Namespace], app.Name)
-	}
 }
 
 func (ac *ApplicationCache) OnDeleteAppResource(cli client.Client, resource appv1beta1.AppResource) {
@@ -376,7 +382,7 @@ func (ac *ApplicationCache) OnDeleteAppResource(cli client.Client, resource appv
 	}
 
 	updateAppResources(resource, app.Status.AppResources)
-	if err := cli.Update(context.TODO(), app); err != nil {
+	if err := cli.Status().Update(context.TODO(), app); err != nil {
 		log.Warnf("update app %s with namespace %s after delete resource %s with namespace %s failed: %s",
 			appInfo.Name, appInfo.Namespace, resource.Name, resource.Namespace, err.Error())
 		return
@@ -385,6 +391,26 @@ func (ac *ApplicationCache) OnDeleteAppResource(cli client.Client, resource appv
 	ac.nsAndApplications[appInfo.Namespace][appInfo.Name] = resources
 	delete(ac.nsAndAppResources[resource.Namespace], genResourceID(resource))
 	if len(resources) == 0 {
-		ac.deleteApplication(cli, app)
+		helper.RemoveFinalizer(app, zcloudAppFinalizer)
+		if err := cli.Update(context.TODO(), app); err != nil {
+			log.Warnf("update app %s with namespace %s after delete app resources failed: %s", app.Name, app.Namespace, err.Error())
+		}
 	}
+}
+
+func (ac *ApplicationCache) getAppInfoAndResources(resource appv1beta1.AppResource) (*ApplicationInfo, appv1beta1.AppResources, bool) {
+	appInfo, ok := ac.getAppInfo(resource)
+	if ok == false {
+		return nil, nil, false
+	}
+
+	resources, ok := ac.getAppResources(appInfo.Namespace, appInfo.Name)
+	if ok == false {
+		log.Warnf("no found app %s with namespace %s", appInfo.Name, appInfo.Namespace)
+		return nil, nil, false
+	}
+
+	rs := make(appv1beta1.AppResources, len(resources))
+	copy(rs, resources)
+	return appInfo, rs, true
 }

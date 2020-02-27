@@ -13,7 +13,8 @@ build:
 	CGO_ENABLED=0 GOOS=linux go build cmd/application-operator/application-operator.go
 
 build-image:
-	docker build -t $(REGISTRY_NAME)/$(IMAGE_NAME):${BRANCH} --build-arg version=${VERSION} --build-arg buildtime=${BUILD} .
+	#docker build -t $(REGISTRY_NAME)/$(IMAGE_NAME):${BRANCH} --build-arg version=${VERSION} --build-arg buildtime=${BUILD} .
+	docker build -t zdnscloud/application-operator:master .
 	docker image prune -f
 
 docker: 
