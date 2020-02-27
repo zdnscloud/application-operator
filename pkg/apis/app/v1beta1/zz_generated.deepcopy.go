@@ -117,6 +117,11 @@ func (in *ApplicationSpec) DeepCopyInto(out *ApplicationSpec) {
 		*out = make([]Manifest, len(*in))
 		copy(*out, *in)
 	}
+	if in.CRDManifests != nil {
+		in, out := &in.CRDManifests, &out.CRDManifests
+		*out = make([]Manifest, len(*in))
+		copy(*out, *in)
+	}
 	return
 }
 

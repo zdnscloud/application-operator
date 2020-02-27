@@ -6,11 +6,13 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	appsv1beta1 "k8s.io/api/apps/v1beta1"
 	appsv1beta2 "k8s.io/api/apps/v1beta2"
 	extv1beta1 "k8s.io/api/extensions/v1beta1"
+	apiextv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,9 +34,13 @@ var (
 )
 
 const (
-	zcloudAppFinalizer         = "app.zcloud.cn.v1beta1/finalizer"
-	ZcloudAppRequestUrlPrefix  = "app.zcloud.cn.v1beta1/url-prefix"
 	AnnKeyForInjectServiceMesh = "linkerd.io/inject"
+
+	zcloudAppFinalizer        = "app.zcloud.cn.v1beta1/finalizer"
+	ZcloudAppRequestUrlPrefix = "app.zcloud.cn.v1beta1/url-prefix"
+
+	crdCheckTimes    = 30
+	crdCheckInterval = 2 * time.Second
 )
 
 type ApplicationInfo struct {
@@ -92,7 +98,7 @@ func (ac *ApplicationCache) OnCreateApplication(cli client.Client, app *appv1bet
 		return
 	}
 
-	if err := createResources(cli, app); err != nil {
+	if err := createAppResources(cli, app); err != nil {
 		log.Warnf("create app %s resources with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
 		app.Status.State = appv1beta1.ApplicationStatusStateFailed
 		if err := cli.Status().Update(context.TODO(), app); err != nil {
@@ -124,6 +130,96 @@ func (ac *ApplicationCache) getAppResources(namespace, name string) (appv1beta1.
 	}
 
 	return nil, false
+}
+
+func createAppResources(cli client.Client, app *appv1beta1.Application) error {
+	if err := preInstallChartCRDs(cli, app.Spec.CRDManifests); err != nil {
+		return fmt.Errorf("create crds for chart %s failed: %s", app.Spec.OwnerChart.Name, err.Error())
+	}
+
+	return createResources(cli, app)
+}
+
+func preInstallChartCRDs(cli client.Client, crdManifests []appv1beta1.Manifest) error {
+	if len(crdManifests) == 0 {
+		return nil
+	}
+
+	var crds []*apiextv1beta1.CustomResourceDefinition
+	for _, manifest := range crdManifests {
+		if err := helper.MapOnRuntimeObject(manifest.Content, func(ctx context.Context, obj runtime.Object) error {
+			crd, ok := obj.(*apiextv1beta1.CustomResourceDefinition)
+			if !ok {
+				return fmt.Errorf("runtime object isn't k8s crd object with file: %s", manifest.File)
+			}
+			crds = append(crds, crd)
+
+			if err := cli.Create(ctx, obj); err != nil {
+				if apierrors.IsAlreadyExists(err) == false {
+					return fmt.Errorf("create crd with file %s failed: %s", manifest.File, err.Error())
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	if !waitCRDsReady(cli, crds) {
+		return fmt.Errorf("wait chart crds to ready timeout")
+	}
+
+	return nil
+}
+
+func waitCRDsReady(cli client.Client, requiredCRDs []*apiextv1beta1.CustomResourceDefinition) bool {
+	for i := 0; i < crdCheckTimes; i++ {
+		if isCRDsReady(cli, requiredCRDs) {
+			return true
+		}
+		time.Sleep(crdCheckInterval)
+	}
+	return false
+}
+
+func isCRDsReady(cli client.Client, requiredCRDs []*apiextv1beta1.CustomResourceDefinition) bool {
+	var crds apiextv1beta1.CustomResourceDefinitionList
+	if err := cli.List(context.TODO(), nil, &crds); err != nil {
+		return false
+	}
+
+	for _, required := range requiredCRDs {
+		ready := false
+		for _, crd := range crds.Items {
+			if crd.Name == required.Name {
+				if isCRDReady(crd) {
+					ready = true
+				}
+				break
+			}
+		}
+		if !ready {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isCRDReady(crd apiextv1beta1.CustomResourceDefinition) bool {
+	for _, cond := range crd.Status.Conditions {
+		switch cond.Type {
+		case apiextv1beta1.Established:
+			if cond.Status == apiextv1beta1.ConditionTrue {
+				return true
+			}
+		case apiextv1beta1.NamesAccepted:
+			if cond.Status == apiextv1beta1.ConditionFalse {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func createResources(cli client.Client, app *appv1beta1.Application) error {

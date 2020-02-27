@@ -16,6 +16,7 @@ type ApplicationSpec struct {
 	InjectServiceMesh bool       `json:"injectServiceMesh,omitempty"`
 	CreatedByAdmin    bool       `json:"createdByAdmin,omitempty"`
 	Manifests         []Manifest `json:"manifests,omitempty"`
+	CRDManifests      []Manifest `json:"crdManifests,omitempty"`
 }
 
 type ChartInfo struct {
