@@ -353,7 +353,7 @@ func updateAppResources(resource appv1beta1.AppResource, resources appv1beta1.Ap
 			resources[i].ReadyReplicas = resource.ReadyReplicas
 			resources[i].CreationTimestamp = resource.CreationTimestamp
 			resources[i].Exists = resource.Exists
-			return r.Replicas <= r.ReadyReplicas, true
+			return r.ReadyReplicas != 0 && r.Replicas <= r.ReadyReplicas, true
 		}
 	}
 
