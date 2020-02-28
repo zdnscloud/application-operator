@@ -58,8 +58,6 @@ func (ac *ApplicationCache) Add(app *appv1beta1.Application) {
 	if ok == false {
 		appAndResources = make(map[string]appv1beta1.AppResources)
 		ac.nsAndApplications[app.Namespace] = appAndResources
-	} else if _, ok := appAndResources[app.Name]; ok {
-		return
 	}
 	appAndResources[app.Name] = app.Status.AppResources
 
@@ -91,12 +89,8 @@ func (ac *ApplicationCache) OnCreateApplication(cli client.Client, app *appv1bet
 		return
 	}
 
-	if err := createAppResources(cli, app); err != nil {
-		log.Warnf("create app %s resources with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
-		app.Status.State = appv1beta1.ApplicationStatusStateFailed
-		if err := cli.Status().Update(context.TODO(), app); err != nil {
-			log.Warnf("update app %s state to failed with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
-		}
+	if err := preInstallChartCRDs(cli, app.Spec.CRDManifests); err != nil {
+		log.Warnf("create crds for chart %s failed: %s", app.Spec.OwnerChart.Name, err.Error())
 		return
 	}
 
@@ -106,10 +100,15 @@ func (ac *ApplicationCache) OnCreateApplication(cli client.Client, app *appv1bet
 		return
 	}
 
-	app.Status.State = appv1beta1.ApplicationStatusStateSucceed
+	if err := createAppResources(cli, app); err != nil {
+		log.Warnf("create app %s resources with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
+		app.Status.State = appv1beta1.ApplicationStatusStateFailed
+	} else {
+		app.Status.State = appv1beta1.ApplicationStatusStateSucceed
+	}
+
 	if err := cli.Status().Update(context.TODO(), app); err != nil {
 		log.Warnf("update app %s status with namespace %s after create app resources failed: %s", app.Name, app.Namespace, err.Error())
-		return
 	}
 
 	ac.Add(app)
@@ -123,14 +122,6 @@ func (ac *ApplicationCache) getAppResources(namespace, name string) (appv1beta1.
 	}
 
 	return nil, false
-}
-
-func createAppResources(cli client.Client, app *appv1beta1.Application) error {
-	if err := preInstallChartCRDs(cli, app.Spec.CRDManifests); err != nil {
-		return fmt.Errorf("create crds for chart %s failed: %s", app.Spec.OwnerChart.Name, err.Error())
-	}
-
-	return createResources(cli, app)
 }
 
 func preInstallChartCRDs(cli client.Client, crdManifests []appv1beta1.Manifest) error {
@@ -215,7 +206,7 @@ func isCRDReady(crd apiextv1beta1.CustomResourceDefinition) bool {
 	return false
 }
 
-func createResources(cli client.Client, app *appv1beta1.Application) error {
+func createAppResources(cli client.Client, app *appv1beta1.Application) error {
 	for i, manifest := range app.Spec.Manifests {
 		if err := helper.MapOnRuntimeObject(manifest.Content, func(ctx context.Context, obj runtime.Object) error {
 			if obj == nil {
@@ -245,6 +236,7 @@ func createResources(cli client.Client, app *appv1beta1.Application) error {
 					Namespace: metaObj.GetNamespace(),
 					Name:      metaObj.GetName(),
 					Type:      appv1beta1.ResourceType(typ),
+					Exists:    true,
 				})
 			}
 			return nil
@@ -313,7 +305,6 @@ func (ac *ApplicationCache) OnCreateAppResource(cli client.Client, resource appv
 		return
 	}
 
-	resource.Exists = true
 	oldIsReady, ok := updateAppResources(resource, app.Status.AppResources)
 	if ok == false {
 		log.Warnf("no found resource %s/%s with namespace %s in application %s/%s status.AppResources",
@@ -352,7 +343,6 @@ func updateAppResources(resource appv1beta1.AppResource, resources appv1beta1.Ap
 			resources[i].Replicas = resource.Replicas
 			resources[i].ReadyReplicas = resource.ReadyReplicas
 			resources[i].CreationTimestamp = resource.CreationTimestamp
-			resources[i].Exists = resource.Exists
 			return r.ReadyReplicas != 0 && r.Replicas <= r.ReadyReplicas, true
 		}
 	}
@@ -369,7 +359,7 @@ func (ac *ApplicationCache) OnDeleteApplication(cli client.Client, app *appv1bet
 		return
 	}
 
-	if err := deleteResources(cli, app); err != nil {
+	if err := ac.deleteAppResources(cli, app); err != nil {
 		log.Warnf("delete application %s resources with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
 		app.Status.State = appv1beta1.ApplicationStatusStateFailed
 		if err := cli.Status().Update(context.TODO(), app); err != nil {
@@ -378,21 +368,43 @@ func (ac *ApplicationCache) OnDeleteApplication(cli client.Client, app *appv1bet
 		return
 	}
 
-	if len(ac.nsAndApplications[app.Namespace][app.Name]) == 0 {
-		delete(ac.nsAndApplications[app.Namespace], app.Name)
-	}
+	ac.deleteApplication(cli, app)
 }
 
-func deleteResources(cli client.Client, app *appv1beta1.Application) error {
+func (ac *ApplicationCache) deleteApplication(cli client.Client, app *appv1beta1.Application) {
+	if len(ac.nsAndApplications[app.Namespace][app.Name]) != 0 {
+		return
+	}
+
+	if helper.HasFinalizer(app, zcloudAppFinalizer) {
+		helper.RemoveFinalizer(app, zcloudAppFinalizer)
+		if err := cli.Update(context.TODO(), app); err != nil {
+			log.Warnf("remove app %s with namespace %s finalizer failed: %s", app.Name, app.Namespace, err.Error())
+			return
+		}
+	}
+
+	delete(ac.nsAndApplications[app.Namespace], app.Name)
+}
+
+func (ac *ApplicationCache) deleteAppResources(cli client.Client, app *appv1beta1.Application) error {
 	for _, manifest := range app.Spec.Manifests {
 		if manifest.Duplicate {
 			continue
 		}
 
 		if err := helper.MapOnRuntimeObject(manifest.Content, func(ctx context.Context, obj runtime.Object) error {
-			_, err := runtimeObjectToMetaObject(obj, app.Namespace, true)
+			gvk := obj.GetObjectKind().GroupVersionKind()
+			metaObj, err := runtimeObjectToMetaObject(obj, app.Namespace, true)
 			if err != nil {
 				return fmt.Errorf("runtime object to meta object with file %s failed: %s", manifest.File, err.Error())
+			}
+
+			if _, ok := ac.getAppInfo(appv1beta1.AppResource{
+				Namespace: metaObj.GetNamespace(),
+				Type:      appv1beta1.ResourceType(strings.ToLower(gvk.Kind)),
+				Name:      metaObj.GetName()}); ok == false {
+				return nil
 			}
 
 			if err := cli.Delete(ctx, obj, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
@@ -449,12 +461,7 @@ func (ac *ApplicationCache) OnDeleteAppResource(cli client.Client, resource appv
 
 	ac.nsAndApplications[appInfo.Namespace][appInfo.Name] = resources
 	delete(ac.nsAndAppResources[resource.Namespace], genResourceID(resource))
-	if len(resources) == 0 {
-		helper.RemoveFinalizer(app, zcloudAppFinalizer)
-		if err := cli.Update(context.TODO(), app); err != nil {
-			log.Warnf("update app %s with namespace %s after delete app resources failed: %s", app.Name, app.Namespace, err.Error())
-		}
-	}
+	ac.deleteApplication(cli, app)
 }
 
 func (ac *ApplicationCache) getAppInfoAndResources(resource appv1beta1.AppResource) (*ApplicationInfo, appv1beta1.AppResources, bool) {
