@@ -37,7 +37,6 @@ type AppResource struct {
 	Name              string       `json:"name"`
 	Type              ResourceType `json:"type"`
 	Exists            bool         `json:"exists"`
-	Link              string       `json:"link,omitempty"`
 	Replicas          int          `json:"replicas,omitempty"`
 	ReadyReplicas     int          `json:"readyReplicas,omitempty"`
 	CreationTimestamp metav1.Time  `json:"creationTimestamp,omitempty"`

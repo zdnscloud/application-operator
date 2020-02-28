@@ -3,15 +3,11 @@ package controller
 import (
 	"context"
 	"fmt"
-	"path"
 	"sort"
 	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
-	appsv1beta1 "k8s.io/api/apps/v1beta1"
-	appsv1beta2 "k8s.io/api/apps/v1beta2"
-	extv1beta1 "k8s.io/api/extensions/v1beta1"
 	apiextv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -23,7 +19,6 @@ import (
 	"github.com/zdnscloud/cement/slice"
 	"github.com/zdnscloud/gok8s/client"
 	"github.com/zdnscloud/gok8s/helper"
-	restutil "github.com/zdnscloud/gorest/util"
 
 	appv1beta1 "github.com/zdnscloud/application-operator/pkg/apis/app/v1beta1"
 )
@@ -36,11 +31,9 @@ var (
 const (
 	AnnKeyForInjectServiceMesh = "linkerd.io/inject"
 
-	zcloudAppFinalizer        = "app.zcloud.cn.v1beta1/finalizer"
-	ZcloudAppRequestUrlPrefix = "app.zcloud.cn.v1beta1/url-prefix"
-
-	crdCheckTimes    = 30
-	crdCheckInterval = 2 * time.Second
+	zcloudAppFinalizer = "app.zcloud.cn.v1beta1/finalizer"
+	crdCheckTimes      = 30
+	crdCheckInterval   = 2 * time.Second
 )
 
 type ApplicationInfo struct {
@@ -293,56 +286,14 @@ func injectServiceMeshToWorkload(typ string, app *appv1beta1.Application, obj ru
 			deploy.Spec.Template.Annotations = make(map[string]string)
 		}
 		deploy.Spec.Template.Annotations[AnnKeyForInjectServiceMesh] = "enabled"
-	case *appsv1beta1.Deployment:
-		deploy := obj.(*appsv1beta1.Deployment)
-		if deploy.Spec.Template.Annotations == nil {
-			deploy.Spec.Template.Annotations = make(map[string]string)
-		}
-		deploy.Spec.Template.Annotations[AnnKeyForInjectServiceMesh] = "enabled"
-	case *appsv1beta2.Deployment:
-		deploy := obj.(*appsv1beta2.Deployment)
-		if deploy.Spec.Template.Annotations == nil {
-			deploy.Spec.Template.Annotations = make(map[string]string)
-		}
-		deploy.Spec.Template.Annotations[AnnKeyForInjectServiceMesh] = "enabled"
-	case *extv1beta1.Deployment:
-		deploy := obj.(*extv1beta1.Deployment)
-		if deploy.Spec.Template.Annotations == nil {
-			deploy.Spec.Template.Annotations = make(map[string]string)
-		}
-		deploy.Spec.Template.Annotations[AnnKeyForInjectServiceMesh] = "enabled"
 	case *appsv1.DaemonSet:
 		ds := obj.(*appsv1.DaemonSet)
 		if ds.Spec.Template.Annotations == nil {
 			ds.Spec.Template.Annotations = make(map[string]string)
 		}
 		ds.Spec.Template.Annotations[AnnKeyForInjectServiceMesh] = "enabled"
-	case *appsv1beta2.DaemonSet:
-		ds := obj.(*appsv1beta2.DaemonSet)
-		if ds.Spec.Template.Annotations == nil {
-			ds.Spec.Template.Annotations = make(map[string]string)
-		}
-		ds.Spec.Template.Annotations[AnnKeyForInjectServiceMesh] = "enabled"
-	case *extv1beta1.DaemonSet:
-		ds := obj.(*extv1beta1.DaemonSet)
-		if ds.Spec.Template.Annotations == nil {
-			ds.Spec.Template.Annotations = make(map[string]string)
-		}
-		ds.Spec.Template.Annotations[AnnKeyForInjectServiceMesh] = "enabled"
 	case *appsv1.StatefulSet:
 		sts := obj.(*appsv1.StatefulSet)
-		if sts.Spec.Template.Annotations == nil {
-			sts.Spec.Template.Annotations = make(map[string]string)
-		}
-		sts.Spec.Template.Annotations[AnnKeyForInjectServiceMesh] = "enabled"
-	case *appsv1beta1.StatefulSet:
-		sts := obj.(*appsv1beta1.StatefulSet)
-		if sts.Spec.Template.Annotations == nil {
-			sts.Spec.Template.Annotations = make(map[string]string)
-		}
-		sts.Spec.Template.Annotations[AnnKeyForInjectServiceMesh] = "enabled"
-	case *appsv1beta2.StatefulSet:
-		sts := obj.(*appsv1beta2.StatefulSet)
 		if sts.Spec.Template.Annotations == nil {
 			sts.Spec.Template.Annotations = make(map[string]string)
 		}
@@ -362,14 +313,20 @@ func (ac *ApplicationCache) OnCreateAppResource(cli client.Client, resource appv
 		return
 	}
 
-	if prefix, ok := app.Annotations[ZcloudAppRequestUrlPrefix]; ok {
-		resource.Link = path.Join(prefix, resource.Namespace, restutil.GuessPluralName(string(resource.Type)), resource.Name)
+	resource.Exists = true
+	oldIsReady, ok := updateAppResources(resource, app.Status.AppResources)
+	if ok == false {
+		log.Warnf("no found resource %s/%s with namespace %s in application %s/%s status.AppResources",
+			string(resource.Type), resource.Name, resource.Namespace, appInfo.Namespace, appInfo.Name)
+		return
 	}
 
-	resource.Exists = true
-	updateAppResources(resource, app.Status.AppResources)
-	if app.Status.WorkloadCount != app.Status.ReadyWorkloadCount {
-		if slice.SliceIndex(supportWorkloadTypes, string(resource.Type)) != -1 && resource.Replicas == resource.ReadyReplicas {
+	if slice.SliceIndex(supportWorkloadTypes, string(resource.Type)) != -1 {
+		if resource.Replicas > resource.ReadyReplicas {
+			if oldIsReady {
+				app.Status.ReadyWorkloadCount -= 1
+			}
+		} else if oldIsReady == false {
 			app.Status.ReadyWorkloadCount += 1
 		}
 	}
@@ -389,17 +346,18 @@ func (ac *ApplicationCache) getAppInfo(resource appv1beta1.AppResource) (*Applic
 	return nil, false
 }
 
-func updateAppResources(resource appv1beta1.AppResource, resources appv1beta1.AppResources) {
+func updateAppResources(resource appv1beta1.AppResource, resources appv1beta1.AppResources) (bool, bool) {
 	for i, r := range resources {
 		if r.Namespace == resource.Namespace && r.Type == resource.Type && r.Name == resource.Name {
 			resources[i].Replicas = resource.Replicas
 			resources[i].ReadyReplicas = resource.ReadyReplicas
 			resources[i].CreationTimestamp = resource.CreationTimestamp
 			resources[i].Exists = resource.Exists
-			resources[i].Link = resource.Link
-			break
+			return r.Replicas <= r.ReadyReplicas, true
 		}
 	}
+
+	return false, false
 }
 
 func (ac *ApplicationCache) OnUpdateAppResource(cli client.Client, resource appv1beta1.AppResource) {
@@ -411,15 +369,13 @@ func (ac *ApplicationCache) OnDeleteApplication(cli client.Client, app *appv1bet
 		return
 	}
 
-	if len(app.Status.AppResources) != 0 {
-		if err := deleteResources(cli, app); err != nil {
-			log.Warnf("delete application %s resources with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
-			app.Status.State = appv1beta1.ApplicationStatusStateFailed
-			if err := cli.Status().Update(context.TODO(), app); err != nil {
-				log.Warnf("update app %s state to failed with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
-			}
-			return
+	if err := deleteResources(cli, app); err != nil {
+		log.Warnf("delete application %s resources with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
+		app.Status.State = appv1beta1.ApplicationStatusStateFailed
+		if err := cli.Status().Update(context.TODO(), app); err != nil {
+			log.Warnf("update app %s state to failed with namespace %s failed: %s", app.Name, app.Namespace, err.Error())
 		}
+		return
 	}
 
 	if len(ac.nsAndApplications[app.Namespace][app.Name]) == 0 {
@@ -473,15 +429,22 @@ func (ac *ApplicationCache) OnDeleteAppResource(cli client.Client, resource appv
 		return
 	}
 
-	if slice.SliceIndex(supportWorkloadTypes, string(resource.Type)) != -1 {
-		app.Status.ReadyWorkloadCount -= 1
-	}
+	oldIsReady, ok := updateAppResources(resource, app.Status.AppResources)
+	if ok == false {
+		log.Warnf("no found resource %s/%s with namespace %s in application %s/%s status.AppResources",
+			string(resource.Type), resource.Name, resource.Namespace, appInfo.Namespace, appInfo.Name)
+	} else {
+		if slice.SliceIndex(supportWorkloadTypes, string(resource.Type)) != -1 {
+			if oldIsReady {
+				app.Status.ReadyWorkloadCount -= 1
+			}
+		}
 
-	updateAppResources(resource, app.Status.AppResources)
-	if err := cli.Status().Update(context.TODO(), app); err != nil {
-		log.Warnf("update app %s with namespace %s after delete resource %s with namespace %s failed: %s",
-			appInfo.Name, appInfo.Namespace, resource.Name, resource.Namespace, err.Error())
-		return
+		if err := cli.Status().Update(context.TODO(), app); err != nil {
+			log.Warnf("update app %s with namespace %s after delete resource %s with namespace %s failed: %s",
+				appInfo.Name, appInfo.Namespace, resource.Name, resource.Namespace, err.Error())
+			return
+		}
 	}
 
 	ac.nsAndApplications[appInfo.Namespace][appInfo.Name] = resources
