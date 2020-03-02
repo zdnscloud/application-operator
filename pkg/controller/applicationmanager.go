@@ -12,6 +12,7 @@ import (
 	extv1beta1 "k8s.io/api/extensions/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/zdnscloud/gok8s/cache"
 	"github.com/zdnscloud/gok8s/client"
@@ -31,7 +32,7 @@ type ApplicationManager struct {
 	lock       sync.RWMutex
 }
 
-func New(c cache.Cache, cli client.Client) (*ApplicationManager, error) {
+func New(c cache.Cache, cli client.Client, eventRecorder record.EventRecorder) (*ApplicationManager, error) {
 	ctrl := gok8sctrl.New("applicationCache", c, scheme.Scheme)
 	ctrl.Watch(&appsv1.Deployment{})
 	ctrl.Watch(&appsv1.DaemonSet{})
@@ -45,7 +46,7 @@ func New(c cache.Cache, cli client.Client) (*ApplicationManager, error) {
 
 	stopCh := make(chan struct{})
 	m := &ApplicationManager{
-		appCache:   newApplicationCache(),
+		appCache:   newApplicationCache(eventRecorder),
 		kubeCache:  c,
 		kubeClient: cli,
 		stopCh:     stopCh,
@@ -88,7 +89,7 @@ func (m *ApplicationManager) OnCreate(e event.CreateEvent) (handler.Result, erro
 	case *appv1beta1.Application:
 		m.appCache.OnCreateApplication(m.kubeClient, obj)
 	case *appsv1.Deployment:
-		m.appCache.OnCreateAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnCreateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace:         obj.Namespace,
 			Name:              obj.Name,
 			Type:              appv1beta1.ResourceTypeDeployment,
@@ -97,7 +98,7 @@ func (m *ApplicationManager) OnCreate(e event.CreateEvent) (handler.Result, erro
 			CreationTimestamp: obj.CreationTimestamp,
 		})
 	case *appsv1.DaemonSet:
-		m.appCache.OnCreateAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnCreateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace:         obj.Namespace,
 			Name:              obj.Name,
 			Type:              appv1beta1.ResourceTypeDaemonSet,
@@ -106,7 +107,7 @@ func (m *ApplicationManager) OnCreate(e event.CreateEvent) (handler.Result, erro
 			CreationTimestamp: obj.CreationTimestamp,
 		})
 	case *appsv1.StatefulSet:
-		m.appCache.OnCreateAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnCreateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace:         obj.Namespace,
 			Name:              obj.Name,
 			Type:              appv1beta1.ResourceTypeStatefulSet,
@@ -115,42 +116,42 @@ func (m *ApplicationManager) OnCreate(e event.CreateEvent) (handler.Result, erro
 			CreationTimestamp: obj.CreationTimestamp,
 		})
 	case *corev1.Service:
-		m.appCache.OnCreateAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnCreateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace:         obj.Namespace,
 			Name:              obj.Name,
 			Type:              appv1beta1.ResourceTypeService,
 			CreationTimestamp: obj.CreationTimestamp,
 		})
 	case *extv1beta1.Ingress:
-		m.appCache.OnCreateAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnCreateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace:         obj.Namespace,
 			Name:              obj.Name,
 			Type:              appv1beta1.ResourceTypeIngress,
 			CreationTimestamp: obj.CreationTimestamp,
 		})
 	case *corev1.ConfigMap:
-		m.appCache.OnCreateAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnCreateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace:         obj.Namespace,
 			Name:              obj.Name,
 			Type:              appv1beta1.ResourceTypeConfigMap,
 			CreationTimestamp: obj.CreationTimestamp,
 		})
 	case *corev1.Secret:
-		m.appCache.OnCreateAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnCreateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace:         obj.Namespace,
 			Name:              obj.Name,
 			Type:              appv1beta1.ResourceTypeSecret,
 			CreationTimestamp: obj.CreationTimestamp,
 		})
 	case *batchv1.Job:
-		m.appCache.OnCreateAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnCreateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace:         obj.Namespace,
 			Name:              obj.Name,
 			Type:              appv1beta1.ResourceTypeJob,
 			CreationTimestamp: obj.CreationTimestamp,
 		})
 	case *batchv1beta1.CronJob:
-		m.appCache.OnCreateAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnCreateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace:         obj.Namespace,
 			Name:              obj.Name,
 			Type:              appv1beta1.ResourceTypeCronJob,
@@ -171,7 +172,7 @@ func (m *ApplicationManager) OnUpdate(e event.UpdateEvent) (handler.Result, erro
 		}
 	case *appsv1.Deployment:
 		if oldDeploy := e.ObjectOld.(*appsv1.Deployment); oldDeploy.Status.ReadyReplicas != obj.Status.ReadyReplicas {
-			m.appCache.OnUpdateAppResource(m.kubeClient, appv1beta1.AppResource{
+			m.appCache.OnUpdateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 				Namespace:         obj.Namespace,
 				Name:              obj.Name,
 				Type:              appv1beta1.ResourceTypeDeployment,
@@ -182,7 +183,7 @@ func (m *ApplicationManager) OnUpdate(e event.UpdateEvent) (handler.Result, erro
 		}
 	case *appsv1.DaemonSet:
 		if oldDs := e.ObjectOld.(*appsv1.DaemonSet); oldDs.Status.NumberReady != obj.Status.NumberReady {
-			m.appCache.OnUpdateAppResource(m.kubeClient, appv1beta1.AppResource{
+			m.appCache.OnUpdateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 				Namespace:         obj.Namespace,
 				Name:              obj.Name,
 				Type:              appv1beta1.ResourceTypeDaemonSet,
@@ -193,7 +194,7 @@ func (m *ApplicationManager) OnUpdate(e event.UpdateEvent) (handler.Result, erro
 		}
 	case *appsv1.StatefulSet:
 		if oldSts := e.ObjectOld.(*appsv1.StatefulSet); oldSts.Status.ReadyReplicas != obj.Status.ReadyReplicas {
-			m.appCache.OnUpdateAppResource(m.kubeClient, appv1beta1.AppResource{
+			m.appCache.OnUpdateAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 				Namespace:         obj.Namespace,
 				Name:              obj.Name,
 				Type:              appv1beta1.ResourceTypeStatefulSet,
@@ -211,58 +212,56 @@ func (m *ApplicationManager) OnDelete(e event.DeleteEvent) (handler.Result, erro
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	switch obj := e.Object.(type) {
-	case *appv1beta1.Application:
-		m.appCache.OnDeleteApplication(m.kubeClient, obj)
 	case *appsv1.Deployment:
-		m.appCache.OnDeleteAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnDeleteAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace: obj.Namespace,
 			Name:      obj.Name,
 			Type:      appv1beta1.ResourceTypeDeployment,
 		})
 	case *appsv1.DaemonSet:
-		m.appCache.OnDeleteAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnDeleteAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace: obj.Namespace,
 			Name:      obj.Name,
 			Type:      appv1beta1.ResourceTypeDaemonSet,
 		})
 	case *appsv1.StatefulSet:
-		m.appCache.OnDeleteAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnDeleteAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace: obj.Namespace,
 			Name:      obj.Name,
 			Type:      appv1beta1.ResourceTypeStatefulSet,
 		})
 	case *corev1.Service:
-		m.appCache.OnDeleteAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnDeleteAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace: obj.Namespace,
 			Name:      obj.Name,
 			Type:      appv1beta1.ResourceTypeService,
 		})
 	case *extv1beta1.Ingress:
-		m.appCache.OnDeleteAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnDeleteAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace: obj.Namespace,
 			Name:      obj.Name,
 			Type:      appv1beta1.ResourceTypeIngress,
 		})
 	case *corev1.ConfigMap:
-		m.appCache.OnDeleteAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnDeleteAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace: obj.Namespace,
 			Name:      obj.Name,
 			Type:      appv1beta1.ResourceTypeConfigMap,
 		})
 	case *corev1.Secret:
-		m.appCache.OnDeleteAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnDeleteAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace: obj.Namespace,
 			Name:      obj.Name,
 			Type:      appv1beta1.ResourceTypeSecret,
 		})
 	case *batchv1.Job:
-		m.appCache.OnDeleteAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnDeleteAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace: obj.Namespace,
 			Name:      obj.Name,
 			Type:      appv1beta1.ResourceTypeJob,
 		})
 	case *batchv1beta1.CronJob:
-		m.appCache.OnDeleteAppResource(m.kubeClient, appv1beta1.AppResource{
+		m.appCache.OnDeleteAppResource(m.kubeClient, obj, appv1beta1.AppResource{
 			Namespace: obj.Namespace,
 			Name:      obj.Name,
 			Type:      appv1beta1.ResourceTypeCronJob,

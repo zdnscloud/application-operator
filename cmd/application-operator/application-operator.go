@@ -7,6 +7,7 @@ import (
 	"github.com/zdnscloud/gok8s/client/config"
 	gok8sctrl "github.com/zdnscloud/gok8s/controller"
 	"github.com/zdnscloud/gok8s/predicate"
+	"github.com/zdnscloud/gok8s/publisher"
 
 	appv1beta1 "github.com/zdnscloud/application-operator/pkg/apis/app/v1beta1"
 	"github.com/zdnscloud/application-operator/pkg/controller"
@@ -38,9 +39,14 @@ func main() {
 		log.Fatalf("create k8s client failed: %s", err.Error())
 	}
 
+	p, err := publisher.New(cfg, options.Scheme)
+	if err != nil {
+		log.Fatalf("create event publisher failed: %s", err.Error())
+	}
+
 	ctrl := gok8sctrl.New("appController", c, options.Scheme)
 	ctrl.Watch(&appv1beta1.Application{})
-	m, err := controller.New(c, kubeClient)
+	m, err := controller.New(c, kubeClient, p.GetEventRecorderFor("applicationoperator"))
 	if err != nil {
 		log.Fatalf("create application manager failed: %s", err.Error())
 	}
